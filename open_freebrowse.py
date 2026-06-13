@@ -1,164 +1,164 @@
 #!/usr/bin/env python3
 """
-Open FreeBrowse (https://github.com/freesurfer/freebrowse) with FreeSurfer outputs.
+Generate a self-contained MRI viewer HTML file.
+All data is embedded — no server required to view it.
 
 Usage:
-    python open_freebrowse.py --t1w path_T1w.nii.gz --flair path_FLAIR.nii.gz \
-        --pial-lh pial.lh --white-lh white.lh
+    python open_freebrowse.py --t1w T1w.nii.gz --flair FLAIR.nii.gz \
+        --pial-lh lh.pial.T1 --white-lh lh.white --output viewer.html
 
 Or edit the DEFAULT_* variables below and run:
     python open_freebrowse.py
 """
 
 import argparse
-import http.server
+import base64
 import json
-import shutil
-import signal
 import sys
 import tempfile
-import threading
-import time
 import urllib.request
 import webbrowser
 from pathlib import Path
 
 # ── Edit these defaults (set to None to omit) ─────────────────────────────────
-DEFAULT_T1W      = "T1w.nii.gz"
+DEFAULT_T1W      = None
 DEFAULT_FLAIR    = None
 DEFAULT_PIAL_LH  = None
 DEFAULT_WHITE_LH = None
 DEFAULT_PIAL_RH  = None
 DEFAULT_WHITE_RH = None
+DEFAULT_OUTPUT   = "viewer.html"
 # ──────────────────────────────────────────────────────────────────────────────
 
-PORT               = 8765
 FREEBROWSE_VERSION = "2.4.1"
 FREEBROWSE_HTML    = f"freebrowse-{FREEBROWSE_VERSION}.html"
 FREEBROWSE_DL_URL  = (
     f"https://freesurfer.github.io/freebrowse/downloads/{FREEBROWSE_HTML}"
 )
-
-# Cache only the downloaded HTML (2.7 MB) so we don't re-download every run.
-HTML_CACHE_DIR = Path(tempfile.gettempdir()) / "freebrowse_html_cache"
+CACHE_DIR = Path(tempfile.gettempdir()) / "freebrowse_html_cache"
 
 
-# ── HTTP server with CORS ──────────────────────────────────────────────────────
-
-def _make_handler(serve_dir: Path):
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=str(serve_dir), **kwargs)
-
-        def end_headers(self):
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            super().end_headers()
-
-        def log_message(self, fmt, *args):
-            pass  # silence request logs
-
-    return Handler
-
-def _start_server(serve_dir: Path, port: int) -> http.server.HTTPServer:
-    server = http.server.HTTPServer(("localhost", port), _make_handler(serve_dir))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
-
-
-# ── Setup ──────────────────────────────────────────────────────────────────────
-
-def _download_html() -> Path:
-    HTML_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    dest = HTML_CACHE_DIR / FREEBROWSE_HTML
+def _download_freebrowse() -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CACHE_DIR / FREEBROWSE_HTML
     if not dest.exists():
         print(f"Downloading FreeBrowse {FREEBROWSE_VERSION} (once)…")
         urllib.request.urlretrieve(FREEBROWSE_DL_URL, dest)
         print("  Done.")
     return dest
 
-def _link_or_copy(src: Path, dst: Path):
-    """Symlink src → dst; fall back to copy if symlinks are unsupported."""
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
-    try:
-        dst.symlink_to(src.resolve())
-    except (OSError, NotImplementedError):
-        shutil.copy2(src, dst)
 
 def _served_name(stem: str, src: Path) -> str:
-    """Return a served filename that preserves the source's extension(s).
+    """Preserve source extension(s) so NiiVue infers the correct file format."""
+    return stem + "".join(src.suffixes)
 
-    Preserving the real extension (e.g. .mgz vs .nii.gz) is critical: NiiVue
-    infers the file format from the filename and will fail to parse an .mgz
-    file that has been renamed to .nii.gz.
-    """
-    suffixes = "".join(src.suffixes)   # ".mgz"  or  ".nii.gz"
-    return stem + suffixes
 
-def _prepare_serve_dir(serve_dir: Path, port: int,
-                       t1w: Path | None = None,
-                       flair: Path | None = None,
-                       pial_lh: Path | None = None,
-                       white_lh: Path | None = None,
-                       pial_rh: Path | None = None,
-                       white_rh: Path | None = None,
-                       lesion: Path | None = None) -> None:
-    # FreeBrowse HTML — symlink to cached copy
-    html_src = _download_html()
-    _link_or_copy(html_src, serve_dir / FREEBROWSE_HTML)
+def _b64(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
 
-    base = f"http://localhost:{port}"
-    image_options = []
-    meshes = []
 
-    # Volumes
-    for stem, src, colormap, opacity in [
-        ("T1w",    t1w,    "gray",   1.0),
-        ("FLAIR",  flair,  "gray",   0.7),
-        ("lesion", lesion, "random", 0.8),
-    ]:
+def _generate_html(volumes: list, meshes: list, output_name: str) -> str:
+    freebrowse_html = _download_freebrowse().read_text(encoding="utf-8")
+
+    embedded = {}      # filename → base64
+    nvd_volumes = []
+    nvd_meshes  = []
+
+    for stem, src, colormap, opacity in volumes:
         if src is None:
             continue
         name = _served_name(stem, src)
-        _link_or_copy(src, serve_dir / name)
-        image_options.append({
-            "url":      f"{base}/{name}",
+        size_mb = src.stat().st_size / 1024 / 1024
+        print(f"  Embedding {src.name}  ({size_mb:.1f} MB)…")
+        embedded[name] = _b64(src)
+        nvd_volumes.append({
+            "url":      f"embedded://{name}",
             "name":     name,
             "colormap": colormap,
             "opacity":  opacity,
             "visible":  True,
         })
 
-    # Surfaces: pial=yellow, white=orange; same colors for LH and RH
-    for served_name, src, color in [
-        ("lh.pial",  pial_lh,  [255, 255, 0,   255]),
-        ("lh.white", white_lh, [255, 165, 0,   255]),
-        ("rh.pial",  pial_rh,  [255, 255, 0,   255]),
-        ("rh.white", white_rh, [255, 165, 0,   255]),
-    ]:
+    for name, src, rgba in meshes:
         if src is None:
             continue
-        _link_or_copy(src, serve_dir / served_name)
-        meshes.append({
-            "url":             f"{base}/{served_name}",
-            "name":            served_name,
-            "rgba255":         color,
+        size_kb = src.stat().st_size / 1024
+        print(f"  Embedding {src.name}  ({size_kb:.0f} KB)…")
+        embedded[name] = _b64(src)
+        nvd_meshes.append({
+            "url":             f"embedded://{name}",
+            "name":            name,
+            "rgba255":         rgba,
             "opacity":         1,
             "visible":         True,
             "meshShaderIndex": 14,
         })
+    # add niivue parameters (e.g. radiological convention)
+    opts = {"isRadiologicalConvention": True}
+    scene = {"imageOptionsArray": nvd_volumes, "meshes": nvd_meshes, "opts": opts}
+    scene['opts']
+    scene_json = json.dumps(scene)
+    embedded_json = json.dumps(embedded)
 
-    scene = {"imageOptionsArray": image_options, "meshes": meshes}
-    (serve_dir / "scene.nvd").write_text(json.dumps(scene, indent=2))
+    # Injected before </body>: intercepts fetch() calls for embedded:// URLs
+    # and for the NVD scene URL, returning in-memory data instead.
+    inject = f"""
+<script>
+(function() {{
+  const EMBEDDED = {embedded_json};
+  const SCENE    = {scene_json};
 
+  function b64ToResponse(b64) {{
+    const raw = atob(b64);
+    const buf = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+    return new Response(buf.buffer, {{
+      status: 200,
+      headers: {{'Content-Type': 'application/octet-stream'}},
+    }});
+  }}
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {{
+    const url = (input instanceof Request ? input.url : String(input));
+
+    // Serve the scene NVD
+    if (url.includes('scene.nvd')) {{
+      return Promise.resolve(new Response(JSON.stringify(SCENE), {{
+        status: 200,
+        headers: {{'Content-Type': 'application/json'}},
+      }}));
+    }}
+
+    // Serve embedded data files
+    const name = url.replace('embedded://', '').split('/').pop().split('?')[0];
+    if (EMBEDDED[name]) {{
+      return Promise.resolve(b64ToResponse(EMBEDDED[name]));
+    }}
+
+    return _fetch(input, init);
+  }};
+
+  // Set the ?nvd= param so FreeBrowse loads the scene on startup
+  if (!location.search.includes('nvd=')) {{
+    const url = new URL(location.href);
+    url.searchParams.set('nvd', 'embedded://scene.nvd');
+    history.replaceState(null, '', url.toString());
+  }}
+}})();
+</script>
+"""
+    # Insert the intercept script as early as possible so fetch is patched
+    # before FreeBrowse's own JS runs.
+    patched = freebrowse_html.replace("<head>", "<head>" + inject, 1)
+    if patched == freebrowse_html:
+        patched = inject + freebrowse_html
+    return patched
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Launch FreeBrowse with FreeSurfer outputs."
+        description="Generate a self-contained MRI viewer HTML (no server needed)."
     )
     parser.add_argument("--t1w",      default=DEFAULT_T1W,      help="T1w volume (.nii.gz or .mgz)")
     parser.add_argument("--flair",    default=DEFAULT_FLAIR,    help="FLAIR volume (.nii.gz or .mgz)")
@@ -167,71 +167,58 @@ def main():
     parser.add_argument("--pial-rh",  default=DEFAULT_PIAL_RH,  help="RH pial surface")
     parser.add_argument("--white-rh", default=DEFAULT_WHITE_RH, help="RH white surface")
     parser.add_argument("--lesion",   default=None,             help="Lesion mask overlay (.nii.gz or .mgz)")
-    parser.add_argument("--port",     default=PORT, type=int,   help=f"Local port (default {PORT})")
+    parser.add_argument("--output",   default=DEFAULT_OUTPUT,   help=f"Output HTML file (default: {DEFAULT_OUTPUT})")
     args = parser.parse_args()
 
-    def _resolve(val) -> Path | None:
+    def _resolve(val):
         return Path(val) if val else None
 
-    optional = {
-        "--t1w":      _resolve(args.t1w),
-        "--flair":    _resolve(args.flair),
-        "--pial-lh":  _resolve(args.pial_lh),
-        "--white-lh": _resolve(args.white_lh),
-        "--pial-rh":  _resolve(args.pial_rh),
-        "--white-rh": _resolve(args.white_rh),
-        "--lesion":   _resolve(args.lesion),
+    t1w      = _resolve(args.t1w)
+    flair    = _resolve(args.flair)
+    pial_lh  = _resolve(args.pial_lh)
+    white_lh = _resolve(args.white_lh)
+    pial_rh  = _resolve(args.pial_rh)
+    white_rh = _resolve(args.white_rh)
+    lesion   = _resolve(args.lesion)
+
+    named = {
+        "--t1w": t1w, "--flair": flair,
+        "--pial-lh": pial_lh, "--white-lh": white_lh,
+        "--pial-rh": pial_rh, "--white-rh": white_rh,
+        "--lesion": lesion,
     }
 
-    missing = [f"{flag}: {p}" for flag, p in optional.items() if p is not None and not p.exists()]
+    missing = [f"{flag}: {p}" for flag, p in named.items()
+               if p is not None and not p.exists()]
     if missing:
         print("Error — file(s) not found:")
         for m in missing:
             print(f"  {m}")
         sys.exit(1)
 
-    provided = [flag for flag, p in optional.items() if p is not None]
-    if not provided:
+    if all(p is None for p in named.values()):
         print("Error — no files provided. Use --t1w, --flair, --pial-lh, etc.")
         sys.exit(1)
 
-    with tempfile.TemporaryDirectory(prefix="freebrowse_serve_") as tmp:
-        serve_dir = Path(tmp)
+    volumes = [
+        ("T1w",    t1w,    "gray",   1.0),
+        ("FLAIR",  flair,  "gray",   0.7),
+        ("lesion", lesion, "random", 0.8),
+    ]
+    meshes = [
+        ("lh.pial",  pial_lh,  [255, 255, 0, 255]),
+        ("lh.white", white_lh, [255, 165, 0, 255]),
+        ("rh.pial",  pial_rh,  [255, 255, 0, 255]),
+        ("rh.white", white_rh, [255, 165, 0, 255]),
+    ]
 
-        _prepare_serve_dir(
-            serve_dir,
-            port=args.port,
-            t1w=optional["--t1w"],
-            flair=optional["--flair"],
-            pial_lh=optional["--pial-lh"],
-            white_lh=optional["--white-lh"],
-            pial_rh=optional["--pial-rh"],
-            white_rh=optional["--white-rh"],
-            lesion=optional["--lesion"],
-        )
-
-        _start_server(serve_dir, args.port)
-
-        url = (
-            f"http://localhost:{args.port}/{FREEBROWSE_HTML}"
-            f"?nvd=http://localhost:{args.port}/scene.nvd"
-        )
-        print(f"Serving at  http://localhost:{args.port}")
-        print(f"Opening     {url}")
-        time.sleep(0.4)
-        webbrowser.open(url)
-
-        print("Server running — press Ctrl+C to stop.")
-        try:
-            signal.pause()
-        except (KeyboardInterrupt, AttributeError):
-            # AttributeError: signal.pause() not available on Windows
-            try:
-                while True:
-                    time.sleep(3600)
-            except KeyboardInterrupt:
-                pass
-        print("\nServer stopped.")
+    output = Path(args.output)
+    print(f"Generating {output}…")
+    html = _generate_html(volumes, meshes, output.name)
+    output.write_text(html, encoding="utf-8")
+    size_mb = output.stat().st_size / 1024 / 1024
+    print(f"Done — {output}  ({size_mb:.1f} MB)")
+    webbrowser.open(output.resolve().as_uri())
 
 
 if __name__ == "__main__":
