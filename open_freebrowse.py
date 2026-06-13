@@ -206,7 +206,7 @@ def main():
 
     output = Path(args.output)
     print(f"Generating {output}…")
-    html = _generate_html(volumes, meshes, output.name)
+    html = _generate_html(volumes, meshes)
     output.write_text(html, encoding="utf-8")
     size_mb = output.stat().st_size / 1024 / 1024
     print(f"Done — {output}  ({size_mb:.1f} MB)")
