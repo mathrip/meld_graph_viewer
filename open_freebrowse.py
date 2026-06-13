@@ -20,16 +20,6 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-# ── Edit these defaults (set to None to omit) ─────────────────────────────────
-DEFAULT_T1W      = None
-DEFAULT_FLAIR    = None
-DEFAULT_PIAL_LH  = None
-DEFAULT_WHITE_LH = None
-DEFAULT_PIAL_RH  = None
-DEFAULT_WHITE_RH = None
-DEFAULT_OUTPUT   = "viewer.html"
-# ──────────────────────────────────────────────────────────────────────────────
-
 FREEBROWSE_VERSION = "2.4.1"
 FREEBROWSE_HTML    = f"freebrowse-{FREEBROWSE_VERSION}.html"
 FREEBROWSE_DL_URL  = (
@@ -57,13 +47,14 @@ def _b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def _generate_html(volumes: list, meshes: list, output_name: str) -> str:
+def _generate_html(volumes: list, meshes: list) -> str:
     freebrowse_html = _download_freebrowse().read_text(encoding="utf-8")
 
     embedded = {}      # filename → base64
     nvd_volumes = []
     nvd_meshes  = []
 
+    # parameters for volumes
     for stem, src, colormap, opacity in volumes:
         if src is None:
             continue
@@ -78,7 +69,7 @@ def _generate_html(volumes: list, meshes: list, output_name: str) -> str:
             "opacity":  opacity,
             "visible":  True,
         })
-
+    # parameters for meshes (surfaces)
     for name, src, rgba in meshes:
         if src is None:
             continue
@@ -91,10 +82,11 @@ def _generate_html(volumes: list, meshes: list, output_name: str) -> str:
             "rgba255":         rgba,
             "opacity":         1,
             "visible":         True,
-            "meshShaderIndex": 14,
+            "meshShaderIndex": 14, # to make it crosscut
         })
-    # add niivue parameters (e.g. radiological convention)
+    # general niivue parameters (e.g. radiological convention)
     opts = {"isRadiologicalConvention": True}
+    # combine all parameters
     scene = {"imageOptionsArray": nvd_volumes, "meshes": nvd_meshes, "opts": opts}
     scene['opts']
     scene_json = json.dumps(scene)
@@ -160,14 +152,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate a self-contained MRI viewer HTML (no server needed)."
     )
-    parser.add_argument("--t1w",      default=DEFAULT_T1W,      help="T1w volume (.nii.gz or .mgz)")
-    parser.add_argument("--flair",    default=DEFAULT_FLAIR,    help="FLAIR volume (.nii.gz or .mgz)")
-    parser.add_argument("--pial-lh",  default=DEFAULT_PIAL_LH,  help="LH pial surface")
-    parser.add_argument("--white-lh", default=DEFAULT_WHITE_LH, help="LH white surface")
-    parser.add_argument("--pial-rh",  default=DEFAULT_PIAL_RH,  help="RH pial surface")
-    parser.add_argument("--white-rh", default=DEFAULT_WHITE_RH, help="RH white surface")
+    parser.add_argument("--t1w",      default='T1w.nii.gz',      help="T1w volume (.nii.gz or .mgz)")
+    parser.add_argument("--flair",    default=None,    help="FLAIR volume (.nii.gz or .mgz)")
+    parser.add_argument("--pial-lh",  default=None,  help="LH pial surface")
+    parser.add_argument("--white-lh", default=None, help="LH white surface")
+    parser.add_argument("--pial-rh",  default=None,  help="RH pial surface")
+    parser.add_argument("--white-rh", default=None, help="RH white surface")
     parser.add_argument("--lesion",   default=None,             help="Lesion mask overlay (.nii.gz or .mgz)")
-    parser.add_argument("--output",   default=DEFAULT_OUTPUT,   help=f"Output HTML file (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--output",   default='viewer.html',   help=f"Output HTML file (default: viewer.html)")
     args = parser.parse_args()
 
     def _resolve(val):
